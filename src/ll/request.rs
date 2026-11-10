@@ -57,6 +57,15 @@ impl From<RequestId> for u64 {
         fh.0
     }
 }
+impl RequestId {
+    /// Whether the kernel queued this request again after a `FUSE_NOTIFY_RESEND`
+    /// (see [`Notifier::resend`](crate::Notifier::resend)) because it had been read
+    /// but not answered. Such a request may have been seen by an earlier server.
+    /// Replies must carry the id unchanged, including this bit.
+    pub fn is_resend(self) -> bool {
+        self.0 & abi::FUSE_UNIQUE_RESEND != 0
+    }
+}
 
 /// A newtype for inode numbers
 ///

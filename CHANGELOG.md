@@ -1,6 +1,13 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add `Session::from_fd_initialized()` to serve a `/dev/fuse` descriptor whose connection the kernel has already
+  initialised, without waiting for `FUSE_INIT`, and `Session::init_outcome()` and `InitOutcome` to record the result
+  of the handshake for it
+* Add `Notifier::resend()` to send `FUSE_NOTIFY_RESEND`, and `RequestId::is_resend()` to tell a request the kernel
+  queued again. `InitFlags::FUSE_HAS_RESEND` can now be negotiated
+* Add `Session::stopper()` to make `Session::run()` return without unmounting or closing the descriptor
+* Event loops wait for readiness instead of spinning when the descriptor is non-blocking
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap

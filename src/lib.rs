@@ -82,6 +82,7 @@ use crate::session::MAX_WRITE_SIZE;
 use crate::session::MIN_WRITE_SIZE;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;
+pub use crate::session::SessionStopper;
 pub use crate::session::SessionUnmounter;
 
 mod access_flags;
@@ -159,9 +160,6 @@ const UNSUPPORTED_CAPABILITIES: InitFlags = ALIASED_UNSUPPORTED_CAPABILITIES
     .union(InitFlags::FUSE_HAS_INODE_DAX)
     // The kernel would route requests to io_uring queues that fuser never creates
     .union(InitFlags::FUSE_OVER_IO_URING)
-    // Announces that the filesystem copes with requests the kernel resends. fuser cannot send
-    // the FUSE_NOTIFY_RESEND notification that asks for a resend in the first place
-    .union(InitFlags::FUSE_HAS_RESEND)
     // The timeout is carried by a request_timeout field of fuse_init_out that fuser declares as
     // reserved and always sends as zero, which the kernel reads as "no timeout requested"
     .union(InitFlags::FUSE_REQUEST_TIMEOUT);
@@ -383,6 +381,30 @@ impl TryFrom<&std::fs::Metadata> for FileAttr {
     }
 }
 
+/// The result of the INIT handshake of a connection with the kernel.
+///
+/// The kernel sends INIT once, when the filesystem is mounted. A session reports the
+/// outcome with [`Session::init_outcome`], and [`Session::from_fd_initialized`] takes a
+/// recorded one, so that a server can resume a connection that is already initialised:
+/// the capabilities decide how later requests are parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitOutcome {
+    /// Protocol version the kernel speaks.
+    pub kernel_abi: Version,
+    /// Capabilities the kernel offered, for example [`InitFlags::FUSE_HAS_RESEND`].
+    pub capabilities: InitFlags,
+    /// Capabilities negotiated: the ones requested that the kernel offered.
+    pub flags: InitFlags,
+    /// Maximum readahead in the reply.
+    pub max_readahead: u32,
+    /// Maximum size of a write request in the reply.
+    pub max_write: u32,
+    /// Timestamp granularity in the reply.
+    pub time_gran: Duration,
+    /// Stacking depth in the reply; zero unless passthrough is negotiated.
+    pub max_stack_depth: u32,
+}
+
 /// Configuration of the fuse kernel module connection
 #[derive(Debug)]
 pub struct KernelConfig {
@@ -426,6 +448,23 @@ impl KernelConfig {
             kernel_abi,
             default_permissions,
             acl,
+        }
+    }
+
+    fn outcome(&self) -> InitOutcome {
+        let flags = self.requested & self.capabilities & !InitFlags::FUSE_INIT_EXT;
+        InitOutcome {
+            kernel_abi: self.kernel_abi,
+            capabilities: self.capabilities & !InitFlags::FUSE_INIT_EXT,
+            flags,
+            max_readahead: self.max_readahead,
+            max_write: self.max_write,
+            time_gran: self.time_gran,
+            max_stack_depth: if flags.contains(InitFlags::FUSE_PASSTHROUGH) {
+                self.max_stack_depth
+            } else {
+                0
+            },
         }
     }
 

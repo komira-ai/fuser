@@ -194,6 +194,9 @@ pub(crate) enum fuse_notify_code {
     FUSE_NOTIFY_INC_EPOCH = 8,
 }
 
+/// Set in the unique id of a request that the kernel queued again after `FUSE_NOTIFY_RESEND`.
+pub(crate) const FUSE_UNIQUE_RESEND: u64 = 1 << 63;
+
 /// ABI version that added `FUSE_NOTIFY_INC_EPOCH`. An older kernel has no case for the
 /// code and answers the write with `EINVAL`
 pub(crate) const FUSE_NOTIFY_INC_EPOCH_VERSION: Version = Version(7, 44);

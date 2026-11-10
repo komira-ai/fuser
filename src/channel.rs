@@ -4,6 +4,10 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use nix::errno::Errno;
+use nix::poll::PollFd;
+use nix::poll::PollFlags;
+use nix::poll::PollTimeout;
+use nix::poll::poll;
 
 use crate::dev_fuse::DevFuse;
 use crate::passthrough::BackingId;
@@ -41,10 +45,54 @@ impl Channel {
         loop {
             match self.receive(buffer) {
                 Ok(size) => return Ok(size),
+                Err(Errno::ENOENT | Errno::EINTR) => continue,
+                // The descriptor is non-blocking (it may have been made so by another
+                // process that held it): wait until there is something to read.
+                Err(Errno::EAGAIN) => {
+                    self.wait_readable(None)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Like `receive_retrying`, but returns `Ok(None)` as soon as `stop` is readable.
+    /// The device must be non-blocking, since another reader may take the request
+    /// this one was woken for.
+    pub(crate) fn receive_until_stopped(
+        &self,
+        stop: BorrowedFd<'_>,
+        buffer: &mut [u8],
+    ) -> nix::Result<Option<usize>> {
+        loop {
+            if self.wait_readable(Some(stop))? {
+                return Ok(None);
+            }
+            match self.receive(buffer) {
+                Ok(size) => return Ok(Some(size)),
                 Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// Block until the device is readable (or has an error to report). Returns true
+    /// if `stop` became readable first.
+    fn wait_readable(&self, stop: Option<BorrowedFd<'_>>) -> nix::Result<bool> {
+        let device = self.0.as_fd();
+        let mut fds = [
+            PollFd::new(device, PollFlags::POLLIN),
+            PollFd::new(stop.unwrap_or(device), PollFlags::POLLIN),
+        ];
+        let watched = if stop.is_some() { 2 } else { 1 };
+        loop {
+            match poll(&mut fds[..watched], PollTimeout::NONE) {
+                Ok(_) => break,
+                Err(Errno::EINTR) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(stop.is_some() && fds[1].revents().is_some_and(|r| !r.is_empty()))
     }
 
     /// Returns the FUSE device of this channel.

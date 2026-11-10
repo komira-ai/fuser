@@ -164,6 +164,26 @@ impl Notifier {
         self.send(notify_code::FUSE_NOTIFY_INC_EPOCH, &notif)
     }
 
+    /// Ask the kernel to queue again every request that was read from this connection
+    /// but not yet answered, so that a server that took over the connection can answer
+    /// them. Each such request arrives again with [`RequestId::is_resend`](crate::RequestId::is_resend)
+    /// true. The kernel requires the requests to be idempotent.
+    ///
+    /// # Errors
+    /// Returns `ENOTSUP` if the kernel did not advertise `InitFlags::FUSE_HAS_RESEND`
+    /// (Linux 6.9 and later, ABI 7.40), rather than sending a notification it rejects with
+    /// an `EINVAL` that says nothing about why.
+    /// Returns an error if the kernel rejects the notification.
+    pub fn resend(&self) -> io::Result<()> {
+        if !self
+            .kernel_capabilities
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+        self.send(notify_code::FUSE_NOTIFY_RESEND, &Notification::new_resend())
+    }
+
     /// What the connection actually speaks: the lower of what the kernel offered during init
     /// and what this crate replied with.
     ///
@@ -273,6 +293,17 @@ mod test {
         notifier(InitFlags::FUSE_HAS_EXPIRE_ONLY)
             .expire_entry(INodeNo::ROOT, OsStr::new("x"))
             .unwrap();
+    }
+
+    #[test]
+    fn resend_refused_without_kernel_support() {
+        let err = notifier(InitFlags::empty()).resend().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTSUP));
+    }
+
+    #[test]
+    fn resend_sent_with_kernel_support() {
+        notifier(InitFlags::FUSE_HAS_RESEND).resend().unwrap();
     }
 
     /// Invalidating is unconditional: it does not depend on the expire capability.

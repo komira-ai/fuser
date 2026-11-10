@@ -20,12 +20,17 @@ use log::debug;
 use log::error;
 use log::info;
 use log::warn;
+use nix::fcntl::FcntlArg;
+use nix::fcntl::FdFlag;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
 use nix::unistd::Uid;
 use nix::unistd::geteuid;
 use parking_lot::Mutex;
 
 use crate::Errno;
 use crate::Filesystem;
+use crate::InitOutcome;
 use crate::KernelConfig;
 use crate::MountOption;
 use crate::ReplyEmpty;
@@ -150,6 +155,10 @@ pub struct Session<FS: Filesystem> {
     /// Some operations are honoured by the kernel without being negotiated, so this,
     /// not `negotiated`, says whether the kernel can perform them
     pub(crate) kernel_capabilities: InitFlags,
+    /// The whole result of the INIT handshake, for `init_outcome`
+    init_outcome: Option<InitOutcome>,
+    /// Read end of the pipe that `SessionStopper` writes to, once one was requested
+    stop: Option<Arc<OwnedFd>>,
     pub(crate) config: Config,
 }
 
@@ -199,6 +208,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
+            init_outcome: None,
+            stop: None,
             config: options.clone(),
         };
 
@@ -229,12 +240,81 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: None,
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
+            init_outcome: None,
+            stop: None,
             config,
         };
 
         session.handshake()?;
 
         Ok(session)
+    }
+
+    /// Wrap a /dev/fuse file descriptor of a connection that the kernel has already
+    /// initialised, for example one inherited from a server that crashed or is being
+    /// replaced. The kernel sends INIT once per mount, so no handshake is run and no
+    /// request is consumed: the session starts serving at once, with `init` (the
+    /// outcome recorded by [`Session::init_outcome`] when the connection was
+    /// initialised) as the state of the connection.
+    ///
+    /// [`Filesystem::init`] is not called. This doesn't mount the filesystem anywhere.
+    /// Use [`Notifier::resend`] to have the kernel queue again the requests the previous
+    /// server had read and not answered.
+    pub fn from_fd_initialized(
+        filesystem: FS,
+        fd: OwnedFd,
+        acl: SessionACL,
+        config: Config,
+        init: InitOutcome,
+    ) -> Self {
+        Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch: Channel::new(Arc::new(DevFuse(File::from(fd)))),
+            mount: UmountOnDrop {
+                mount: Arc::new(Mutex::new(None)),
+            },
+            allowed: acl,
+            session_owner: geteuid(),
+            proto_version: Some(init.kernel_abi),
+            negotiated: init.flags,
+            kernel_capabilities: init.capabilities,
+            init_outcome: Some(init),
+            stop: None,
+            config,
+        }
+    }
+
+    /// The outcome of the INIT handshake, to record it for [`Session::from_fd_initialized`].
+    /// Always `Some` for a session returned by `new`, `from_fd` or `from_fd_initialized`.
+    pub fn init_outcome(&self) -> Option<InitOutcome> {
+        self.init_outcome
+    }
+
+    /// Returns a handle that makes [`Session::run`] return once its event loops have
+    /// stopped reading requests, without unmounting or aborting the connection. A
+    /// request that was read has been passed to the filesystem; the filesystem is
+    /// destroyed as at any end of the loop. The descriptor is made non-blocking, as
+    /// the event loops poll it.
+    /// # Errors
+    /// Returns an error if called twice, if the pipe the handle needs can't be created,
+    /// or if the descriptor can't be made non-blocking.
+    pub fn stopper(&mut self) -> io::Result<SessionStopper> {
+        if self.stop.is_some() {
+            return Err(io::Error::other("stopper() was already called"));
+        }
+        let (read, write) = nix::unistd::pipe()?;
+        for fd in [&read, &write] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        }
+        let flags = OFlag::from_bits_retain(fcntl(self.ch.as_fd(), FcntlArg::F_GETFL)?);
+        fcntl(
+            self.ch.as_fd(),
+            FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+        )?;
+        self.stop = Some(Arc::new(read));
+        Ok(SessionStopper(Arc::new(write)))
     }
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
@@ -277,6 +357,8 @@ impl<FS: Filesystem> Session<FS> {
             proto_version,
             negotiated,
             kernel_capabilities,
+            init_outcome: _,
+            stop,
             config,
         } = self;
 
@@ -327,6 +409,7 @@ impl<FS: Filesystem> Session<FS> {
                 negotiated,
                 kernel_capabilities,
                 kernel_abi: proto_version,
+                stop: stop.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -470,6 +553,7 @@ impl<FS: Filesystem> Session<FS> {
             self.proto_version = Some(v);
             self.negotiated = init.capabilities() & config.requested;
             self.kernel_capabilities = init.capabilities();
+            self.init_outcome = Some(config.outcome());
 
             // Log capability status for debugging
             for bit in 0..64 {
@@ -538,6 +622,22 @@ impl<FS: Filesystem> Session<FS> {
     }
 }
 
+/// A thread-safe handle that stops the event loops of a session, see [`Session::stopper`].
+#[derive(Debug, Clone)]
+pub struct SessionStopper(Arc<OwnedFd>);
+
+impl SessionStopper {
+    /// Make the event loops of the session return. Calling it again has no further effect.
+    /// # Errors
+    /// Returns an error if the pipe can't be written.
+    pub fn stop(&self) -> io::Result<()> {
+        match nix::unistd::write(&*self.0, &[0]) {
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
 pub struct SessionUnmounter {
@@ -564,6 +664,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) negotiated: InitFlags,
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) kernel_abi: Option<Version>,
+    stop: Option<Arc<OwnedFd>>,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
@@ -575,8 +676,13 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
-                Ok(size) => {
+            let received = match &self.stop {
+                None => self.ch.receive_retrying(buf).map(Some),
+                Some(stop) => self.ch.receive_until_stopped(stop.as_fd(), buf),
+            };
+            match received {
+                Ok(None) => return Ok(()),
+                Ok(Some(size)) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
                         // Dispatch request
                         Some(req) => {
@@ -727,10 +833,16 @@ mod test {
     use std::io::Write;
     use std::mem::ManuallyDrop;
 
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
     use super::*;
     use crate::Config;
+    use crate::FileHandle;
+    use crate::INodeNo;
     use crate::InitFlags;
     use crate::KernelConfig;
+    use crate::ReplyAttr;
     use crate::Request;
 
     /// A filesystem that requests FUSE_ABORT_ERROR during init, so that after an
@@ -1683,5 +1795,273 @@ mod test {
         }
         let path = std::path::PathBuf::from(format!("/sys/fs/fuse/connections/{}/abort", device?));
         path.exists().then_some(path)
+    }
+
+    /// The device end of a datagram socket pair stands in for /dev/fuse: like the device, it
+    /// delivers one request per read and takes one reply per write.
+    fn fake_device() -> (OwnedFd, UnixDatagram) {
+        let (device, kernel) = UnixDatagram::pair().unwrap();
+        kernel
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        (OwnedFd::from(device), kernel)
+    }
+
+    fn request(opcode: abi::fuse_opcode, unique: u64, body: &[u8]) -> Vec<u8> {
+        let len = (size_of::<abi::fuse_in_header>() + body.len()) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&(opcode as u32).to_ne_bytes());
+        buf.extend_from_slice(&unique.to_ne_bytes());
+        buf.extend_from_slice(&1u64.to_ne_bytes()); // nodeid
+        buf.extend_from_slice(&[0; 16]); // uid, gid, pid, padding
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn getattr(unique: u64) -> Vec<u8> {
+        request(abi::fuse_opcode::FUSE_GETATTR, unique, &[0; 16])
+    }
+
+    fn init(major: u32, minor: u32, flags: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&major.to_ne_bytes());
+        body.extend_from_slice(&minor.to_ne_bytes());
+        body.extend_from_slice(&65536u32.to_ne_bytes()); // max_readahead
+        body.extend_from_slice(&(flags as u32).to_ne_bytes());
+        body.extend_from_slice(&((flags >> 32) as u32).to_ne_bytes());
+        body.extend_from_slice(&[0; 44]);
+        request(abi::fuse_opcode::FUSE_INIT, 1, &body)
+    }
+
+    /// Returns the (error, unique) of the next message the session wrote, and its length.
+    fn read_reply(kernel: &UnixDatagram) -> (i32, u64, usize) {
+        let mut buf = [0u8; 256];
+        let n = kernel.recv(&mut buf).unwrap();
+        let len = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(len as usize, n);
+        let error = i32::from_ne_bytes(buf[4..8].try_into().unwrap());
+        let unique = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        (error, unique, n)
+    }
+
+    /// Answers `getattr` with `EBADF`, and records whether each request was a resend.
+    #[derive(Default)]
+    struct TestFs {
+        resends: Arc<Mutex<Vec<bool>>>,
+        init_calls: Arc<Mutex<u32>>,
+        offered_resend: Arc<Mutex<Option<bool>>>,
+        passthrough_depth: u32,
+    }
+
+    impl Filesystem for TestFs {
+        fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+            *self.init_calls.lock() += 1;
+            let resend = config.capabilities().contains(InitFlags::FUSE_HAS_RESEND);
+            *self.offered_resend.lock() = Some(resend);
+            if resend {
+                config.add_capabilities(InitFlags::FUSE_HAS_RESEND).unwrap();
+            }
+            config.set_max_write(4096).unwrap();
+            if self.passthrough_depth > 0 {
+                config
+                    .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
+                    .unwrap();
+                config.set_max_stack_depth(self.passthrough_depth).unwrap();
+            }
+            Ok(())
+        }
+
+        fn getattr(&self, req: &Request, _ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+            self.resends.lock().push(req.unique().is_resend());
+            reply.error(Errno::EBADF);
+        }
+    }
+
+    fn flag_pair(flags: InitFlags) -> u64 {
+        flags.bits() | InitFlags::FUSE_INIT_EXT.bits()
+    }
+
+    fn handshake(fs: TestFs, offered: InitFlags) -> (Session<TestFs>, UnixDatagram) {
+        let (device, kernel) = fake_device();
+        kernel.send(&init(7, 40, flag_pair(offered))).unwrap();
+        let session = Session::from_fd(fs, device, SessionACL::All, Config::default()).unwrap();
+        (session, kernel)
+    }
+
+    #[test]
+    fn from_fd_runs_the_handshake_and_reports_its_outcome() {
+        let fs = TestFs::default();
+        let (init_calls, offered) = (fs.init_calls.clone(), fs.offered_resend.clone());
+        let (session, kernel) =
+            handshake(fs, InitFlags::FUSE_HAS_RESEND | InitFlags::FUSE_MAX_PAGES);
+
+        let (error, unique, _) = read_reply(&kernel);
+        assert_eq!((error, unique), (0, 1));
+        assert_eq!(*init_calls.lock(), 1);
+        assert_eq!(*offered.lock(), Some(true));
+        let outcome = session.init_outcome().unwrap();
+        assert_eq!(outcome.kernel_abi, Version(7, 40));
+        assert_eq!(
+            outcome.capabilities,
+            InitFlags::FUSE_HAS_RESEND | InitFlags::FUSE_MAX_PAGES
+        );
+        assert!(outcome.flags.contains(InitFlags::FUSE_HAS_RESEND));
+        assert!(!outcome.flags.contains(InitFlags::FUSE_INIT_EXT));
+        assert_eq!(outcome.max_readahead, 65536);
+        assert_eq!(outcome.max_write, 4096);
+        assert_eq!(outcome.max_stack_depth, 0);
+    }
+
+    #[test]
+    fn outcome_reports_the_stack_depth_only_with_passthrough() {
+        let fs = TestFs {
+            passthrough_depth: 2,
+            ..TestFs::default()
+        };
+        let (session, _kernel) = handshake(fs, InitFlags::FUSE_PASSTHROUGH);
+        let outcome = session.init_outcome().unwrap();
+        assert!(outcome.flags.contains(InitFlags::FUSE_PASSTHROUGH));
+        assert_eq!(outcome.max_stack_depth, 2);
+    }
+
+    #[test]
+    fn from_fd_still_refuses_a_connection_that_is_already_initialised() {
+        let (device, kernel) = fake_device();
+        kernel.send(&getattr(9)).unwrap();
+        let err = Session::from_fd(
+            TestFs::default(),
+            device,
+            SessionACL::All,
+            Config::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let (error, unique, _) = read_reply(&kernel);
+        assert_eq!((error, unique), (-libc::EIO, 9));
+    }
+
+    #[test]
+    fn from_fd_initialized_serves_a_queued_request_without_init() {
+        let (device, kernel) = fake_device();
+        let fs = TestFs::default();
+        let (resends, init_calls) = (fs.resends.clone(), fs.init_calls.clone());
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::FUSE_HAS_RESEND);
+        let recorded = recorded.init_outcome().unwrap();
+
+        // The request is queued before the session exists, as it is when a job calls
+        // while no server is reading.
+        kernel.send(&getattr(5)).unwrap();
+        let mut session =
+            Session::from_fd_initialized(fs, device, SessionACL::All, Config::default(), recorded);
+        assert_eq!(session.init_outcome(), Some(recorded));
+        let stopper = session.stopper().unwrap();
+        let server = thread::spawn(move || session.run());
+
+        let (error, unique, _) = read_reply(&kernel);
+        assert_eq!((error, unique), (-libc::EBADF, 5));
+        stopper.stop().unwrap();
+        server.join().unwrap().unwrap();
+        assert_eq!(*resends.lock(), vec![false]);
+        assert_eq!(*init_calls.lock(), 0);
+    }
+
+    #[test]
+    fn a_resent_request_is_marked_and_answered_under_its_id() {
+        let (device, kernel) = fake_device();
+        let fs = TestFs::default();
+        let resends = fs.resends.clone();
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::empty());
+        let recorded = recorded.init_outcome().unwrap();
+        let mut session =
+            Session::from_fd_initialized(fs, device, SessionACL::All, Config::default(), recorded);
+        let stopper = session.stopper().unwrap();
+        let server = thread::spawn(move || session.run());
+
+        let unique = 7 | abi::FUSE_UNIQUE_RESEND;
+        kernel.send(&getattr(unique)).unwrap();
+        assert_eq!(read_reply(&kernel), (-libc::EBADF, unique, 16));
+        kernel.send(&getattr(8)).unwrap();
+        assert_eq!(read_reply(&kernel), (-libc::EBADF, 8, 16));
+
+        stopper.stop().unwrap();
+        server.join().unwrap().unwrap();
+        assert_eq!(*resends.lock(), vec![true, false]);
+    }
+
+    #[test]
+    fn resend_is_a_header_only_notification() {
+        let (device, kernel) = fake_device();
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::FUSE_HAS_RESEND);
+        let recorded = recorded.init_outcome().unwrap();
+        let session = Session::from_fd_initialized(
+            TestFs::default(),
+            device,
+            SessionACL::All,
+            Config::default(),
+            recorded,
+        );
+
+        session.notifier().resend().unwrap();
+        // Notifications have unique 0 and the notify code in the error field.
+        assert_eq!(read_reply(&kernel), (7, 0, 16));
+    }
+
+    #[test]
+    fn a_stopper_ends_every_event_loop_and_leaves_the_device_open() {
+        let (device, kernel) = fake_device();
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::empty());
+        let recorded = recorded.init_outcome().unwrap();
+        let config = Config {
+            n_threads: Some(if cfg!(target_os = "linux") { 3 } else { 1 }),
+            ..Config::default()
+        };
+        let mut session = Session::from_fd_initialized(
+            TestFs::default(),
+            device,
+            SessionACL::All,
+            config,
+            recorded,
+        );
+        let stopper = session.stopper().unwrap();
+        assert!(session.stopper().is_err());
+        let device = nix::unistd::dup(session.as_fd()).unwrap();
+        let server = thread::spawn(move || session.run());
+
+        stopper.stop().unwrap();
+        stopper.clone().stop().unwrap();
+        server.join().unwrap().unwrap();
+
+        // The connection was not closed: the next server can read from the same device.
+        kernel.send(&getattr(3)).unwrap();
+        let mut buf = [0u8; 64];
+        let flags = OFlag::from_bits_retain(fcntl(&device, FcntlArg::F_GETFL).unwrap());
+        assert!(flags.contains(OFlag::O_NONBLOCK));
+        assert_eq!(nix::unistd::read(&device, &mut buf).unwrap(), 56);
+    }
+
+    #[test]
+    fn a_non_blocking_device_waits_for_requests() {
+        let (device, kernel) = fake_device();
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::empty());
+        let recorded = recorded.init_outcome().unwrap();
+        fcntl(&device, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        let session = Session::from_fd_initialized(
+            TestFs::default(),
+            device,
+            SessionACL::All,
+            Config::default(),
+            recorded,
+        );
+        let server = thread::spawn(move || session.run());
+
+        kernel.send(&getattr(4)).unwrap();
+        assert_eq!(read_reply(&kernel), (-libc::EBADF, 4, 16));
+        kernel
+            .send(&request(abi::fuse_opcode::FUSE_DESTROY, 6, &[]))
+            .unwrap();
+        assert_eq!(read_reply(&kernel), (0, 6, 16));
+        server.join().unwrap().unwrap();
     }
 }
