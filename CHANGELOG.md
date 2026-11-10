@@ -7,6 +7,7 @@
 * Add `Notifier::resend()` to send `FUSE_NOTIFY_RESEND`, and `RequestId::is_resend()` to tell a request the kernel
   queued again
 * Add `Session::stopper()` to make `Session::run()` return without unmounting or closing the descriptor
+* Add `Notifier::backing_id_from_raw()` to take a backing id that an earlier server of the connection registered, without `unsafe`
 * Event loops wait for readiness instead of spinning when the descriptor is non-blocking
 
 ## 0.18.0 - 2026-07-22

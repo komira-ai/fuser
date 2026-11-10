@@ -970,4 +970,20 @@ mod test {
         assert_eq!(read_reply(&kernel), (0, 6, 16));
         server.join().unwrap().unwrap();
     }
+
+    #[test]
+    fn a_backing_id_of_an_earlier_server_is_taken_without_unsafe() {
+        let (device, _kernel) = fake_device();
+        let (recorded, _kernel) = handshake(TestFs::default(), InitFlags::empty());
+        let recorded = recorded.init_outcome().unwrap();
+        let session = Session::from_fd_initialized(
+            TestFs::default(),
+            device,
+            SessionACL::All,
+            Config::default(),
+            recorded,
+        );
+        // Giving it up again leaves the id open in the kernel, as the server that registered it did.
+        assert_eq!(session.notifier().backing_id_from_raw(5).into_raw(), 5);
+    }
 }

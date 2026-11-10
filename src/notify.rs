@@ -8,6 +8,7 @@ use crate::INodeNo;
 use crate::channel::ChannelSender;
 use crate::ll::fuse_abi::fuse_notify_code as notify_code;
 use crate::ll::notify::Notification;
+use crate::passthrough::BackingId;
 
 /// A handle to a pending `poll()` request.
 #[derive(Copy, Clone, Debug)]
@@ -115,6 +116,21 @@ impl Notifier {
     /// Returns an error if the kernel rejects the notification.
     pub fn resend(&self) -> io::Result<()> {
         self.send(notify_code::FUSE_NOTIFY_RESEND, &Notification::new_resend())
+    }
+
+    /// Takes a backing id that a server of this connection registered earlier (for example the
+    /// process this one replaced, which gave it up with [`BackingId::into_raw`]), so that it can be
+    /// answered in [`ReplyOpen::opened_passthrough`](crate::ReplyOpen::opened_passthrough) and is
+    /// closed when the returned value is dropped.
+    ///
+    /// Nothing here can break memory safety: an id that is not open in this connection makes the
+    /// kernel fail the open that names it, and the close that the drop makes, and the failure of
+    /// the close is logged. Unlike [`ReplyOpen::wrap_backing`](crate::ReplyOpen::wrap_backing) this
+    /// is not `unsafe`, so that a server which forbids `unsafe` code can resume a connection with
+    /// open passthrough files.
+    pub fn backing_id_from_raw(&self, id: u32) -> BackingId {
+        // SAFETY of the call: the id is only a number the kernel checks on every use.
+        unsafe { self.0.wrap_backing(id) }
     }
 
     #[allow(unused)]
