@@ -1,5 +1,14 @@
 # FUSE for Rust - Changelog
 
+## Unreleased
+* Add `Session::from_fd_initialized()` to serve a `/dev/fuse` descriptor whose connection the kernel has already
+  initialised, without waiting for `FUSE_INIT`, and `Session::init_outcome()` and `InitOutcome` to record the result
+  of the handshake for it
+* Add `Notifier::resend()` to send `FUSE_NOTIFY_RESEND`, and `RequestId::is_resend()` to tell a request the kernel
+  queued again
+* Add `Session::stopper()` to make `Session::run()` return without unmounting or closing the descriptor
+* Event loops wait for readiness instead of spinning when the descriptor is non-blocking
+
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`
 * Rename `mount2()` to `mount()`

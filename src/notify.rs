@@ -104,6 +104,19 @@ impl Notifier {
         self.send_inval(notify_code::FUSE_NOTIFY_DELETE, &notif)
     }
 
+    /// Ask the kernel to queue again every request that was read from this connection
+    /// but not yet answered, so that a server that took over the connection can answer
+    /// them. Each such request arrives again with [`RequestId::is_resend`](crate::RequestId::is_resend) true.
+    ///
+    /// Needs a kernel that offered [`InitFlags::FUSE_HAS_RESEND`](crate::InitFlags::FUSE_HAS_RESEND) (Linux 6.9 or later,
+    /// FUSE protocol 7.40); otherwise the kernel rejects the notification and an error is
+    /// returned. The kernel requires the requests to be idempotent.
+    /// # Errors
+    /// Returns an error if the kernel rejects the notification.
+    pub fn resend(&self) -> io::Result<()> {
+        self.send(notify_code::FUSE_NOTIFY_RESEND, &Notification::new_resend())
+    }
+
     #[allow(unused)]
     fn send_inval(&self, code: notify_code, notification: &Notification<'_>) -> io::Result<()> {
         match self.send(code, notification) {

@@ -114,6 +114,10 @@ impl<'a> Notification<'a> {
         Ok(Self::from_struct_with_name(&r, name.as_bytes()))
     }
 
+    pub(crate) fn new_resend() -> Self {
+        Self::Bare(NotificationBuf::new())
+    }
+
     pub(crate) fn new_poll(kh: PollHandle) -> Self {
         let r = abi::fuse_notify_poll_wakeup_out { kh: kh.0 };
         Self::from_struct(&r)
@@ -197,6 +201,18 @@ mod test {
             0x24, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x61, 0x62, 0x63, 0x00,
+        ];
+        assert_eq!(n, expected);
+    }
+
+    #[test]
+    fn resend() {
+        let n = Notification::new_resend()
+            .with_iovec(abi::fuse_notify_code::FUSE_NOTIFY_RESEND, ioslice_to_vec)
+            .unwrap();
+        let expected = vec![
+            0x10, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
         ];
         assert_eq!(n, expected);
     }

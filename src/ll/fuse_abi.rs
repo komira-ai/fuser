@@ -182,7 +182,11 @@ pub(crate) enum fuse_notify_code {
     FUSE_NOTIFY_STORE = 4,
     FUSE_NOTIFY_RETRIEVE = 5,
     FUSE_NOTIFY_DELETE = 6,
+    FUSE_NOTIFY_RESEND = 7,
 }
+
+/// Set in the unique id of a request that the kernel queued again after `FUSE_NOTIFY_RESEND`.
+pub(crate) const FUSE_UNIQUE_RESEND: u64 = 1 << 63;
 
 #[repr(C)]
 #[derive(Debug, IntoBytes, KnownLayout, Immutable)]

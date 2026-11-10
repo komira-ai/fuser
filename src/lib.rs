@@ -78,6 +78,7 @@ pub use crate::session::BackgroundSession;
 use crate::session::MAX_WRITE_SIZE;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;
+pub use crate::session::SessionStopper;
 pub use crate::session::SessionUnmounter;
 
 mod access_flags;
@@ -202,6 +203,29 @@ pub struct FileAttr {
     pub blksize: u32,
     /// Flags (macOS only, see chflags(2))
     pub flags: u32,
+}
+
+/// The result of the INIT handshake of a connection with the kernel.
+///
+/// The kernel sends INIT once, when the filesystem is mounted. A session reports the
+/// outcome with [`Session::init_outcome`], and [`Session::from_fd_initialized`] takes a
+/// recorded one, so that a server can resume a connection that is already initialised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitOutcome {
+    /// Protocol version the kernel speaks.
+    pub kernel_abi: Version,
+    /// Capabilities the kernel offered, for example [`InitFlags::FUSE_HAS_RESEND`].
+    pub capabilities: InitFlags,
+    /// Capabilities enabled in the reply to the kernel.
+    pub flags: InitFlags,
+    /// Maximum readahead in the reply.
+    pub max_readahead: u32,
+    /// Maximum size of a write request in the reply.
+    pub max_write: u32,
+    /// Timestamp granularity in the reply.
+    pub time_gran: Duration,
+    /// Stacking depth in the reply; zero unless passthrough is enabled.
+    pub max_stack_depth: u32,
 }
 
 /// Configuration of the fuse kernel module connection
@@ -375,6 +399,23 @@ impl KernelConfig {
         let previous = self.congestion_threshold();
         self.congestion_threshold = Some(value);
         Ok(previous)
+    }
+
+    fn outcome(&self) -> InitOutcome {
+        let flags = self.requested & self.capabilities & !InitFlags::FUSE_INIT_EXT;
+        InitOutcome {
+            kernel_abi: self.kernel_abi,
+            capabilities: self.capabilities(),
+            flags,
+            max_readahead: self.max_readahead,
+            max_write: self.max_write,
+            time_gran: self.time_gran,
+            max_stack_depth: if flags.contains(InitFlags::FUSE_PASSTHROUGH) {
+                self.max_stack_depth
+            } else {
+                0
+            },
+        }
     }
 
     fn congestion_threshold(&self) -> u16 {
