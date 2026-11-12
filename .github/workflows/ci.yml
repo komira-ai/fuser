@@ -105,6 +105,8 @@ jobs:
         run: INTERACTIVE="" make pre
 
   mac-ci:
+    # Not a PR check: PR checks run on Linux x86_64 only. macOS runs on push to master.
+    if: github.event_name != 'pull_request'
     runs-on: macos-26
     env:
       RUSTFLAGS: --deny warnings

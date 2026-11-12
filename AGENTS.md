@@ -3,6 +3,10 @@
 Most tests are run as integration tests. See the Makefile for various targets. PJDFS tests are much faster than
 the XFS test suite. Only run the full XFS test suite to verify your work at the end.
 
+## CI
+Pull request checks run on Linux x86_64 hosted runners (`ubuntu-*`) only. Other platforms (the `mac-ci` job on
+macOS) run on push to master, not on pull requests.
+
 ## Style guide
 - Comments should be brief and focus on important invariants, architectural details, or other
   long-term relevant information. They should not contain minor implementation details of the current
